@@ -1,0 +1,80 @@
+name: Deploy MedAI
+
+on:
+  push:
+    branches: [main]
+
+env:
+  AWS_REGION: ap-south-1
+
+jobs:
+  deploy:
+    name: Build, deploy Lambda stack, sync SPA
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # Required for OIDC credential exchange (no long-lived secrets)
+      contents: read
+
+    steps:
+      # ── Checkout ─────────────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Node setup ───────────────────────────────────────────────────────────
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      # ── AWS credentials via OIDC ─────────────────────────────────────────────
+      # Uses an IAM role trusted by GitHub OIDC — no long-lived access keys stored
+      # in GitHub. See the runbook for one-time IAM setup.
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # ── Deploy Lambda / API Gateway stack first ───────────────────────────────
+      # Deploy the API stack before building the SPA so VITE_API_BASE_URL is
+      # always valid (CDK is idempotent — no-ops if nothing changed).
+      - name: Install CDK dependencies
+        run: npm ci
+        working-directory: infra
+
+      - name: Deploy API stack (Lambda + API Gateway + Secrets refs)
+        run: npx cdk deploy MedAiApiStack --require-approval never
+        working-directory: infra
+
+      # ── Build SPA ─────────────────────────────────────────────────────────────
+      # VITE_API_BASE_URL is the only non-Supabase env var needed.
+      # No AI provider keys appear here.
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build SPA
+        env:
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+          VITE_API_BASE_URL: ${{ secrets.VITE_API_BASE_URL }}
+        run: npm run build
+
+      # ── Sync dist/ to S3 ─────────────────────────────────────────────────────
+      - name: Sync dist/ to S3
+        run: |
+          aws s3 sync dist/ s3://${{ secrets.S3_BUCKET_NAME }} \
+            --delete \
+            --cache-control "public, max-age=31536000, immutable" \
+            --exclude "index.html"
+          # index.html must not be cached aggressively — browsers must always
+          # fetch the latest entry point to get updated JS hashes
+          aws s3 cp dist/index.html s3://${{ secrets.S3_BUCKET_NAME }}/index.html \
+            --cache-control "no-cache, no-store, must-revalidate"
+
+      # ── Invalidate CloudFront ─────────────────────────────────────────────────
+      - name: Invalidate CloudFront cache
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }} \
+            --paths "/*"

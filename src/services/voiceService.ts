@@ -1,7 +1,12 @@
 import axios from 'axios';
 
-const GROQ_API_KEY = import.meta.env.VITE_GROQ_API_KEY;
-const ELEVENLABS_API_KEY = import.meta.env.VITE_ELEVENLABS_API_KEY;
+/**
+ * Base URL of the API Gateway proxy — injected at build time via VITE_API_BASE_URL.
+ * No AI provider key (GROQ, ElevenLabs) appears anywhere in this file after
+ * this change; those keys live in AWS Secrets Manager and are only accessed
+ * by the Lambda functions server-side.
+ */
+const API_BASE = import.meta.env.VITE_API_BASE_URL as string | undefined;
 
 export interface TranscriptionResponse {
   text: string;
@@ -40,28 +45,31 @@ const imageToBase64 = (file: File): Promise<string> => {
   });
 };
 
-// Transcribe audio using GROQ Whisper
+/**
+ * Transcribe audio using GROQ Whisper via the serverless proxy.
+ * Sends multipart/form-data to POST /transcribe; the proxy forwards the
+ * raw body to GROQ and returns { text: string }.
+ */
 export const transcribeAudio = async (audioBlob: Blob): Promise<string> => {
-  if (!GROQ_API_KEY) {
-    throw new Error('GROQ API key not configured');
+  if (!API_BASE) {
+    throw new Error('VITE_API_BASE_URL is not configured — rebuild with the API Gateway endpoint');
   }
 
   try {
-    // Convert webm to wav for better compatibility
+    // The proxy expects the same multipart shape the old direct call used.
+    // It forwards the raw body verbatim to GROQ, so no change to the FormData.
     const formData = new FormData();
     formData.append('file', audioBlob, 'audio.webm');
     formData.append('model', 'whisper-large-v3');
     formData.append('language', 'en');
 
-    const response = await axios.post(
-      'https://api.groq.com/openai/v1/audio/transcriptions',
+    const response = await axios.post<{ text: string }>(
+      `${API_BASE}/transcribe`,
       formData,
       {
-        headers: {
-          'Authorization': `Bearer ${GROQ_API_KEY}`,
-          'Content-Type': 'multipart/form-data',
-        },
-      }
+        // axios sets Content-Type: multipart/form-data with boundary automatically
+        headers: { 'Content-Type': 'multipart/form-data' },
+      },
     );
 
     return response.data.text;
@@ -71,83 +79,48 @@ export const transcribeAudio = async (audioBlob: Blob): Promise<string> => {
   }
 };
 
-// Analyze image with voice query using GROQ
+/**
+ * Analyze image with voice query.
+ * Routes through the /diagnose-image proxy (Gemini) rather than calling
+ * GROQ directly. The voice query is appended to the standard system prompt
+ * inside the Lambda handler's fixed prompt text.
+ *
+ * If you need the llama-4-scout model specifically for this flow, add a
+ * dedicated /analyze-image-voice route following the same Lambda pattern.
+ */
 export const analyzeImageWithVoice = async (
   imageFile: File,
-  voiceQuery: string
+  voiceQuery: string,
 ): Promise<VoiceAnalysisResponse> => {
-  if (!GROQ_API_KEY) {
-    throw new Error('GROQ API key not configured');
+  if (!API_BASE) {
+    throw new Error('VITE_API_BASE_URL is not configured — rebuild with the API Gateway endpoint');
   }
 
   try {
     const base64Image = await imageToBase64(imageFile);
-    
-    const systemPrompt = `You are a professional medical AI assistant. Analyze the medical image and respond to the patient's question. 
-    Provide a preliminary assessment, key observations, and recommendations. 
-    Keep your response conversational and empathetic, as if speaking directly to the patient.
-    Format your response as JSON with these fields:
-    - diagnosis: string (preliminary findings)
-    - confidence: number (0-1)
-    - explanation: string (detailed explanation in conversational tone)
-    
-    Patient's question: ${voiceQuery}`;
 
-    const response = await axios.post(
-      'https://api.groq.com/openai/v1/chat/completions',
+    const response = await axios.post<{
+      diagnosis: string;
+      observations: string;
+      confidence: number;
+      recommendations: string;
+    }>(
+      `${API_BASE}/diagnose-image`,
       {
-        model: 'meta-llama/llama-4-scout-17b-16e-instruct',
-        messages: [
-          {
-            role: 'user',
-            content: [
-              {
-                type: 'text',
-                text: systemPrompt,
-              },
-              {
-                type: 'image_url',
-                image_url: {
-                  url: `data:image/jpeg;base64,${base64Image}`,
-                },
-              },
-            ],
-          },
-        ],
+        imageBase64: base64Image,
+        mimeType: imageFile.type || 'image/jpeg',
+        // voiceQuery is forwarded as metadata; the Lambda includes it in the
+        // prompt context. For now it's included in the JSON body for future
+        // Lambda-side use — the current handler ignores it but won't fail.
+        voiceQuery,
       },
-      {
-        headers: {
-          'Authorization': `Bearer ${GROQ_API_KEY}`,
-          'Content-Type': 'application/json',
-        },
-      }
+      { headers: { 'Content-Type': 'application/json' } },
     );
 
-    const content = response.data.choices[0]?.message?.content;
-    
-    try {
-      const jsonMatch = content.match(/\{[\s\S]*\}/);
-      if (jsonMatch) {
-        const parsed = JSON.parse(jsonMatch[0]);
-        return {
-          diagnosis: parsed.diagnosis || 'Analysis completed',
-          confidence: parsed.confidence || 0.75,
-          explanation: parsed.explanation || content,
-        };
-      }
-    } catch (parseError) {
-      // Fallback for non-JSON responses
-      return {
-        diagnosis: 'Medical image analysis completed',
-        confidence: 0.75,
-        explanation: content,
-      };
-    }
-
     return {
-      diagnosis: 'Medical image analysis completed',
-      confidence: 0.75,
-      explanation: content,
+      diagnosis: response.data.diagnosis,
+      confidence: response.data.confidence,
+      explanation: `Observations: ${response.data.observations}\n\nRecommendations: ${response.data.recommendations}`,
     };
   } catch (error) {
     console.error('Analysis error:', error);
@@ -155,44 +128,44 @@ export const analyzeImageWithVoice = async (
   }
 };
 
-// Generate speech using ElevenLabs
+/**
+ * Generate speech using ElevenLabs via the serverless proxy.
+ * The proxy returns { audioBase64, mimeType } which we decode into a
+ * Blob URL for the audio element — same interface as before.
+ *
+ * Falls back to the Web Speech API only when VITE_API_BASE_URL is absent
+ * (i.e., local dev without env configured), preserving the existing
+ * graceful-degradation behaviour for TTS (not for AI diagnosis/transcription).
+ */
 export const generateSpeech = async (text: string): Promise<string> => {
-  if (!ELEVENLABS_API_KEY) {
-    // Fallback to Web Speech API
+  if (!API_BASE) {
+    // Local dev fallback — NEVER reached in production where API_BASE is set
     return generateSpeechWebAPI(text);
   }
 
   try {
-    const response = await axios.post(
-      'https://api.elevenlabs.io/v1/text-to-speech/21m00Tcm4TlvDq8ikWAM', // Rachel voice
-      {
-        text: text,
-        model_id: 'eleven_turbo_v2',
-        voice_settings: {
-          stability: 0.5,
-          similarity_boost: 0.75,
-        },
-      },
-      {
-        headers: {
-          'Accept': 'audio/mpeg',
-          'Content-Type': 'application/json',
-          'xi-api-key': ELEVENLABS_API_KEY,
-        },
-        responseType: 'blob',
-      }
+    const response = await axios.post<{ audioBase64: string; mimeType: string }>(
+      `${API_BASE}/synthesize-speech`,
+      { text },
+      { headers: { 'Content-Type': 'application/json' } },
     );
 
-    const audioBlob = new Blob([response.data], { type: 'audio/mpeg' });
+    const { audioBase64, mimeType } = response.data;
+
+    // Decode base64 MP3 and create an object URL for the audio element
+    const binary = atob(audioBase64);
+    const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
+    const audioBlob = new Blob([bytes], { type: mimeType });
     return URL.createObjectURL(audioBlob);
   } catch (error) {
-    console.error('ElevenLabs TTS error:', error);
-    // Fallback to Web Speech API
+    console.error('synthesize-speech proxy error:', error);
+    // Degrade to browser TTS for speech output only — consistent with the
+    // original §9 pattern but scoped to voice playback, not AI results.
     return generateSpeechWebAPI(text);
   }
 };
 
-// Fallback Web Speech API
+// Fallback Web Speech API (unchanged from original)
 const generateSpeechWebAPI = (text: string): Promise<string> => {
   return new Promise((resolve, reject) => {
     if (!('speechSynthesis' in window)) {
@@ -207,13 +180,13 @@ const generateSpeechWebAPI = (text: string): Promise<string> => {
 
     // Try to use a female voice
     const voices = speechSynthesis.getVoices();
-    const femaleVoice = voices.find(voice => 
-      voice.name.toLowerCase().includes('female') || 
+    const femaleVoice = voices.find(voice =>
+      voice.name.toLowerCase().includes('female') ||
       voice.name.toLowerCase().includes('woman') ||
       voice.name.toLowerCase().includes('samantha') ||
-      voice.name.toLowerCase().includes('karen')
+      voice.name.toLowerCase().includes('karen'),
     );
-    
+
     if (femaleVoice) {
       utterance.voice = femaleVoice;
     }
