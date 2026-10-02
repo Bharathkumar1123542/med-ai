@@ -39,86 +39,43 @@ const DiagnosisForm: React.FC = () => {
     setImagePreview(null);
   };
 
-  const analyzeWithGemini = async (imageBase64: string): Promise<any> => {
-    const API_KEY = import.meta.env.VITE_GEMINI_API_KEY;
-    
-    if (!API_KEY) {
-      throw new Error('Gemini API key not configured');
+  /**
+   * Calls the serverless proxy at POST /diagnose-image.
+   * No AI provider key is present in this bundle — the proxy holds the key
+   * server-side in AWS Secrets Manager.
+   */
+  const analyzeWithGemini = async (imageBase64: string): Promise<{
+    diagnosis: string;
+    observations: string;
+    confidence: number;
+    recommendations: string;
+  }> => {
+    const apiBase = import.meta.env.VITE_API_BASE_URL;
+    if (!apiBase) {
+      throw new Error('VITE_API_BASE_URL is not set — rebuild with the API Gateway endpoint');
     }
 
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${API_KEY}`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          contents: [
-            {
-              parts: [
-                {
-                  text: `As a medical AI assistant, analyze this medical image and provide:
-                  1. A preliminary diagnosis or findings
-                  2. Key observations
-                  3. Confidence level (0-1)
-                  4. Recommendations for further evaluation
-                  
-                  Format your response as a JSON object with these fields:
-                  - diagnosis: string
-                  - observations: string
-                  - confidence: number (0-1)
-                  - recommendations: string
-                  
-                  Important: This is for educational/assistant purposes only and should not replace professional medical consultation.`
-                },
-                {
-                  inline_data: {
-                    mime_type: 'image/jpeg',
-                    data: imageBase64,
-                  },
-                },
-              ],
-            },
-          ],
-        }),
-      }
-    );
+    const response = await fetch(`${apiBase}/diagnose-image`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ imageBase64, mimeType: 'image/jpeg' }),
+    });
 
     if (!response.ok) {
-      throw new Error('Failed to analyze image with Gemini API');
+      const err = await response.json().catch(() => ({} as Record<string, string>));
+      throw new Error(
+        (err as { detail?: string; error?: string }).detail ??
+        (err as { detail?: string; error?: string }).error ??
+        `Proxy returned HTTP ${response.status}`,
+      );
     }
 
-    const data = await response.json();
-    const textContent = data.candidates[0]?.content?.parts[0]?.text;
-    
-    if (!textContent) {
-      throw new Error('No analysis returned from Gemini API');
-    }
-
-    try {
-      // Try to parse JSON from the response
-      const jsonMatch = textContent.match(/\{[\s\S]*\}/);
-      if (jsonMatch) {
-        return JSON.parse(jsonMatch[0]);
-      } else {
-        // Fallback: parse the text response manually
-        return {
-          diagnosis: textContent.split('\n')[0] || 'Analysis completed',
-          observations: textContent,
-          confidence: 0.75,
-          recommendations: 'Please consult with a healthcare professional for proper evaluation.',
-        };
-      }
-    } catch (parseError) {
-      // Fallback for non-JSON responses
-      return {
-        diagnosis: 'Medical image analysis completed',
-        observations: textContent,
-        confidence: 0.75,
-        recommendations: 'Please consult with a healthcare professional for proper evaluation.',
-      };
-    }
+    return response.json() as Promise<{
+      diagnosis: string;
+      observations: string;
+      confidence: number;
+      recommendations: string;
+    }>;
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
